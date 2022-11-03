@@ -6,9 +6,12 @@ import matplotlib.transforms as transforms
 
 class NoValidStartPointFoundError(ValueError):
     '''raise this when the method can't find a good start location'''
+    
+class InvalidCovariance(ValueError):
+    '''raise this when the covariance is singular'''    
 
 class TruncMVN():
-    def __init__(self,mean,cov,planes,thinning=1,burnin=None):
+    def __init__(self,mean,cov,planes,thinning=1,burnin=None,verbose=False):
         """
         Create the truncated MVN. You need to specify the mean and covariance of the multivariate normal (MVN), and
         the normals to the planes that will truncate this MVN. We assume for this version that the planes pass through
@@ -26,6 +29,8 @@ class TruncMVN():
         self.Phi = planes.astype(float)
         self.thinning = thinning
         self.burnin = burnin
+        self.verbose = verbose
+        if np.linalg.det(cov)<1e-9: raise InvalidCovariance("Covariance singular")
         
     def getboundaries(self,x,axis):
         """
@@ -75,12 +80,15 @@ class TruncMVN():
 
     def findstartpoint(self,margin=1e-8):
         startx = self.mean.copy()
+        if self.verbose: print("Finding Start Point")
         for it in range(10000):
+            if self.verbose: print(".",end="")
             v = self.Phi @ startx
             idx = np.where(v<margin)[0] #get planes that we are on the wrong side of
             if len(idx)==0: 
                 return startx
             startx = self.getnearestpoint(self.Phi.T[:,idx[0]],startx)
+        if self.verbose: print("")            
         raise NoValidStartPointFoundError("No valid start location has been found. Specify one, using 'initx' and/or check the domain contains non-zero space (i.e. that the truncations don't completely occlude the space.")
         
     def sample_truncnorm(self,a,b,loc,scale,size):
@@ -88,9 +96,66 @@ class TruncMVN():
         Sample from a one dimensional (univariate) truncated normal, that has mean at 'loc', standard deviation 'scale',
         and is truncated from 'a' to 'b'. Returns 'size' samples.
         """
+        
+        #if we have a singular covariance, then we're going have problems with a and b being invalid, etc...
+        #this isn't going to mix, etc... but we'll leave this code here for now.
+        if scale<=1e-9:
+            if loc<a: return a
+            if loc>b: return b
+            return loc
+            
         a, b = (a - loc) / scale, (b - loc) / scale
         return truncnorm.rvs(a,b,loc=loc,scale=scale,size=size)
 
+    def oldsample(self,initx=None,samples=10):
+        """
+        Sample from the truncated MVN.
+        Parameters:
+            initx = the start location for sampling, if not set, then the tool tries to find a valid (non-zero/truncated) location
+                        close to the MVN's mean.
+            samples = number of samples (default 10).
+        """
+        if initx is None: 
+            initx = self.findstartpoint()
+            
+        x = initx
+        xs = []
+        #remcovinv = []
+        remcovmat = []
+        remcovinvtimesrmmat = []        
+        if self.verbose: print("Computing inverses etc, for conditional distributions.")
+        for axis in range(len(self.mean)):
+            #remcovinv.append(np.linalg.inv(np.delete(np.delete(self.cov,axis,0),axis,1)))
+            remcovmat.append(np.delete(self.cov[axis,:],axis))
+            remcovinvtimesrmmat.append(np.delete(self.cov[axis,:],axis) @ np.linalg.inv(np.delete(np.delete(self.cov,axis,0),axis,1)))
+
+        if self.burnin == None:
+            burnin = samples * self.thinning
+        else:
+            burnin = self.burnin
+        if self.verbose: print("Sampling")
+        for it in range(samples*self.thinning+burnin):
+            if self.verbose: print("%5d/%5d [%s]\r" % (it,samples*self.thinning+burnin,"burn-in" if it<burnin else "samples"), end="")
+            for axis in range(len(self.mean)):
+                #remcov = np.delete(np.delete(self.cov,axis,0),axis,1)                
+                #cond_var = self.cov[axis,axis] - remcovmat[axis] @ remcovinv[axis] @ remcovmat[axis].T
+                #cond_mean = (self.mean[axis] + remcovmat[axis] @ remcovinv[axis] @ (np.delete(x,axis) - np.delete(self.mean,axis)))
+                
+                cond_var = self.cov[axis,axis] - remcovinvtimesrmmat[axis] @ remcovmat[axis].T
+                cond_mean = (self.mean[axis] + remcovinvtimesrmmat[axis] @ (np.delete(x,axis) - np.delete(self.mean,axis)))
+                
+                
+                bs = self.getboundaries(x,axis)
+                
+                s = self.sample_truncnorm(bs[0],bs[1],cond_mean,np.sqrt(cond_var),1)
+                x[axis] = s
+            if it>=burnin:
+                if it%self.thinning == 0:
+                    xs.append(x.copy())
+        if self.verbose: print("")                    
+        xs = np.array(xs)
+        return xs
+        
     def sample(self,initx=None,samples=10):
         """
         Sample from the truncated MVN.
@@ -104,35 +169,30 @@ class TruncMVN():
             
         x = initx
         xs = []
-        remcovinv = []
-        remcovmat = []
-
-        for axis in range(len(self.mean)):
-            remcovinv.append(np.linalg.inv(np.delete(np.delete(self.cov,axis,0),axis,1)))
-            remcovmat.append(np.delete(self.cov[axis,:],axis))
         
-  
+        if self.verbose: print("Computing inverse, for conditional distributions.")
+        invcov = np.linalg.inv(self.cov)
+        
         if self.burnin == None:
             burnin = samples * self.thinning
         else:
             burnin = self.burnin
             
-        for it in range(samples*self.thinning+burnin): 
+        if self.verbose: print("Sampling")            
+        for it in range(samples*self.thinning+burnin):
+            if self.verbose: print("%5d/%5d [%s]\r" % (it,samples*self.thinning+burnin,"burn-in" if it<burnin else "samples"), end="")
             for axis in range(len(self.mean)):
-                #remcov = np.delete(np.delete(self.cov,axis,0),axis,1)                
-                cond_var = self.cov[axis,axis] - remcovmat[axis] @ remcovinv[axis] @ remcovmat[axis].T
-                cond_mean = (self.mean[axis] + remcovmat[axis] @ remcovinv[axis] @ (np.delete(x,axis) - np.delete(self.mean,axis)))
-                
-                
+                cond_var = 1/invcov[axis,axis] #self.cov[axis,axis] - remcovinvtimesrmmat[axis] @ remcovmat[axis].T
+                cond_mean = x[axis] - (invcov@(x-self.mean))[axis]/invcov[axis,axis] #(self.mean[axis] + remcovinvtimesrmmat[axis] @ (np.delete(x,axis) - np.delete(self.mean,axis)))
                 bs = self.getboundaries(x,axis)
-                
                 s = self.sample_truncnorm(bs[0],bs[1],cond_mean,np.sqrt(cond_var),1)
                 x[axis] = s
-            if it>burnin:
+            if it>=burnin:
                 if it%self.thinning == 0:
                     xs.append(x.copy())
+        if self.verbose: print("")                    
         xs = np.array(xs)
-        return xs
+        return xs        
     
     def plot(self,samples=100):
         """
