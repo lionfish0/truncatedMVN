@@ -60,7 +60,8 @@ class TruncMVN():
         #avoids division by zero warnings
         P = self.Phi.T[axis]
         P[P==0]=1e-9
-        PhiTimesx = self.previous - self.Phi[:,update_axis]*self.previousx + self.Phi[:,update_axis]*x[update_axis]
+        #PhiTimesx = self.previous - self.Phi[:,update_axis]*self.previousx + self.Phi[:,update_axis]*x[update_axis]
+        PhiTimesx = self.previous + self.Phi[:,update_axis]*(x[update_axis]-self.previousx)
         vs = -(PhiTimesx - self.Phi[:,axis]*x[axis])/P
         #vs = -((self.Phi[:,:axis] @ x[:axis]) + (self.Phi[:,(axis+1):] @ x[(axis+1):]))/P
         #print(np.max(np.abs(vs-vs2)))
@@ -69,51 +70,15 @@ class TruncMVN():
         if len(lowv)==0: 
             lowv = -1000000
         else:
-            lowv = max(lowv)
+            lowv = np.max(lowv)
         if len(highv)==0: 
             highv = 1000000
         else:
-            highv = min(highv)
+            highv = np.min(highv)
         self.previous = PhiTimesx
         self.previousx = x[axis]
         return [lowv,highv]
         
-    def old_getboundaries(self,x,axis):
-        """
-        For a location 'x', and a given axis direction (specified by 'axis'),
-             find the points of these planes nearest to x along the axis passing through x.
-             
-        This algorithm assumes x is in a valid location, so doesn't check the 'direction' of each normal. Instead it
-             just looks for the nearest plane-axis-crossing point on each side of x along the axis.
-             
-        Example: Four planes cross the axes, in this case two on each side of x. We want the locations of the nearest
-             points to x, marked as 'a' and 'b':
-            \   \                           /     |
-             \   \                         /      |
-              \   \                       /       |
-            ---\---a------------x--------b--------|-------axis
-                \   \                   /         |
-                 \   \                 /          |
-        Returns: (a list) of the two scalar values of these two points (a) and (b) along the axis.
-        """
-        
-        #avoids division by zero warnings
-        P = self.Phi.T[axis]
-        P[P==0]=1e-9
-        vs = -((self.Phi[:,:axis] @ x[:axis]) + (self.Phi[:,(axis+1):] @ x[(axis+1):]))/P
-        
-        lowv = vs[vs<x[axis]]
-        highv = vs[vs>x[axis]]
-        if len(lowv)==0: 
-            lowv = -1000000
-        else:
-            lowv = max(lowv)
-        if len(highv)==0: 
-            highv = 1000000
-        else:
-            highv = min(highv)
-            
-        return [lowv,highv]   
              
         
     def getnearestpoint(self,w,x,margin=1e-4):
@@ -155,20 +120,22 @@ class TruncMVN():
         a, b = (a - loc) / scale, (b - loc) / scale
         return truncnorm.rvs(a,b,loc=loc,scale=scale,size=size)
 
-        #DELETE
+     
     def fast_populate_truncnorm(self):
-        self.samps = np.zeros([50,50,5000])
-        self.indexes = np.zeros([100,100]).astype(int)
-        self.vals = np.linspace(-250,250,50)
+        res = 300
+        self.fast_samples = 2000
+        self.samps = np.zeros([res,res,self.fast_samples])
+        self.indexes = np.zeros([res,res]).astype(int)
+        self.vals = np.linspace(-300,300,res)
         for i,a in enumerate(self.vals):
             print("%3d/%3d\r" % (i,len(self.vals)),end="")
             for j,b in enumerate(self.vals):
                 if b<=a: continue
-                s = self.sample_truncnorm(a,b,loc=0,scale=1,size=5000)
+                s = self.sample_truncnorm(a,b,loc=0,scale=1,size=self.fast_samples)
                 self.samps[i,j,:] = s
         print("")
                
-          #DELETE 
+    
     def fast_sample_truncnorm(self,a,b,loc,scale):
         try: 
 
@@ -180,27 +147,37 @@ class TruncMVN():
             try:
                 index = np.argmax((newa<s) & (s<newb))
             except ValueError:
-                self.fast_populate_truncnorm()
+                print("!",end="")
+                #self.fast_populate_truncnorm()
+                s = self.sample_truncnorm(self.vals[wa],self.vals[wb],loc=0,scale=1,size=self.fast_samples)
+                self.samps[wa,wb,:] = s
+                self.indexes[wa,wb] = 0
                 return self.fast_sample_truncnorm(a,b,loc,scale)
             if (newa>=s[index]) & (s[index]>=newb):
+                print("x",end="")
                 raise IndexError("Not quickly finding solution")
             self.indexes[wa,wb] += index + 1
             return self.samps[wa,wb,index+startindex]*scale + loc
             
         except IndexError:
-            print("fast_truncnorm cache miss")
+            print("m",end="")
+            #print("m (newa=%0.2f,newb=%0.2f)" % (newa,newb),end="")
             return self.sample_truncnorm(a,b,loc=loc,scale=scale,size=1)
 
 
 
-    def sample(self,initx=None,samples=10,useold=False):
+    def sample(self,initx=None,samples=10,usecaching=True):
         """
         Sample from the truncated MVN.
         Parameters:
             initx = the start location for sampling, if not set, then the tool tries to find a valid (non-zero/truncated) location
                         close to the MVN's mean.
             samples = number of samples (default 10).
+            usecaching = whether to precache samples (the truncnorm rvs method is faster if you ask for lots of samples at once!)
         """
+        if usecaching:
+            if not hasattr(self,'fast_samples'): self.fast_populate_truncnorm()
+        
         if initx is None: 
             initx = self.findstartpoint()
         else:
@@ -232,22 +209,20 @@ class TruncMVN():
             if self.verbose: print("%5d/%5d [%s]\r" % (it,samples*self.thinning+burnin,"burn-in" if it<burnin else "samples"), end="")
             for axis in range(len(self.mean)):
                 cond_var = 1/invcov[axis,axis] #self.cov[axis,axis] - remcovinvtimesrmmat[axis] @ remcovmat[axis].T
-                if useold:                 
-                    cond_mean = x[axis] - (invcov@(x-self.mean))[axis]/invcov[axis,axis] 
-                else:
-                    invcovmod = self.invprevious - invcov[:,axis-1]*self.previousxminusmean + invcov[:,axis-1]*(x[axis-1]-self.mean[axis-1])
-        
-                    self.invprevious = invcovmod
-                    self.previousxminusmean = x[axis] - self.mean[axis]
-                    cond_mean = x[axis] - invcovmod[axis]/invcov[axis,axis]
+                invcovmod = self.invprevious - invcov[:,axis-1]*self.previousxminusmean + invcov[:,axis-1]*(x[axis-1]-self.mean[axis-1])
+    
+                self.invprevious = invcovmod
+                self.previousxminusmean = x[axis] - self.mean[axis]
+                cond_mean = x[axis] - invcovmod[axis]/invcov[axis,axis]
 
-                if useold:
-                   bs = self.old_getboundaries(x,axis)
-                else:
-                    bs = self.getboundaries(x,axis,axis-1)                
+                bs = self.getboundaries(x,axis,axis-1)                
                 
-                s = self.sample_truncnorm(bs[0],bs[1],cond_mean,np.sqrt(cond_var),1)
-                #s = self.fast_sample_truncnorm(bs[0],bs[1],cond_mean,np.sqrt(cond_var))
+                if usecaching:
+                    s = self.fast_sample_truncnorm(bs[0],bs[1],cond_mean,np.sqrt(cond_var))                
+                else:
+                    s = self.sample_truncnorm(bs[0],bs[1],cond_mean,np.sqrt(cond_var),1)                
+
+
                 x[axis] = s
             if it>=burnin:
                 if it%self.thinning == 0:
