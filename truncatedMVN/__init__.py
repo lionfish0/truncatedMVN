@@ -166,7 +166,7 @@ class TruncMVN():
 
 
 
-    def sample(self,initx=None,samples=10,usecaching=True):
+    def sample(self,initx=None,samples=10,usecaching=False):
         """
         Sample from the truncated MVN.
         Parameters:
@@ -209,7 +209,8 @@ class TruncMVN():
             if self.verbose: print("%5d/%5d [%s]\r" % (it,samples*self.thinning+burnin,"burn-in" if it<burnin else "samples"), end="")
             for axis in range(len(self.mean)):
                 cond_var = 1/invcov[axis,axis] #self.cov[axis,axis] - remcovinvtimesrmmat[axis] @ remcovmat[axis].T
-                invcovmod = self.invprevious - invcov[:,axis-1]*self.previousxminusmean + invcov[:,axis-1]*(x[axis-1]-self.mean[axis-1])
+                #invcovmod = self.invprevious - invcov[:,axis-1]*self.previousxminusmean + invcov[:,axis-1]*(x[axis-1]-self.mean[axis-1])
+                invcovmod = self.invprevious + invcov[:,axis-1]*((x[axis-1]-self.mean[axis-1])-self.previousxminusmean)
     
                 self.invprevious = invcovmod
                 self.previousxminusmean = x[axis] - self.mean[axis]
@@ -249,7 +250,7 @@ class TruncMVN():
         plt.scatter(samps[:,0],samps[:,1],1)
             
        
-    def compute_gelman_rubin(self,Nsamples=100,Nchains=10):
+    def compute_gelman_rubin(self,Nsamples=100,Nchains=10,usecaching=False):
         """
         Computes the Gelman Rubin statistic. Note that we use the same start location, so this might
         cause an overestimate of the convergence.
@@ -261,7 +262,8 @@ class TruncMVN():
         chainmeans = []
         chainvars = []
         for chains in range(Nchains):
-            samps = self.sample(samples=Nsamples)
+            if self.verbose: print("chain %d of %d\r" % (chains,Nchains),end="")
+            samps = self.sample(samples=Nsamples,usecaching=usecaching)
             chainmeans.append(np.mean(samps,0))
             chainvars.append(np.var(samps,0,ddof=1))
         chainmeans = np.array(chainmeans)
@@ -271,6 +273,86 @@ class TruncMVN():
 
         GR = (((Nsamples-1)/Nsamples) * winthinchainvar + (1/Nsamples) * betweenchainvar) / winthinchainvar
         return GR
+             
+             
+class NotFindingEnoughSamplesDueToRejection(ValueError):
+    '''raise this when the method tries for ages to find any samples with rejection sampling'''
+    
+class TruncMVNrejection(TruncMVN):
+    def __init__(self,mean,cov,planes,verbose=False):
+        """
+        Create the truncated MVN. You need to specify the mean and covariance of the multivariate normal (MVN), and
+        the normals to the planes that will truncate this MVN. We assume for this version that the planes pass through
+        the origin (as this was our use case).
+        
+        mean = (D) vector: location of the MVN
+        cov = (DxD) matrix: covariance of the MVN
+        planes = (NxD) matrix, each row a normal to a plane (vector points to 'valid' side of plane)
+        
+        thinning = how much thinning to do during sampling
+        burnin = how many iterations of burnin to have (defaults to number of iterations used to generate samples)
+        """
+        self.mean = mean.astype(float)
+        self.cov = cov.astype(float)
+        self.Phi = planes.astype(float)
+        self.verbose = verbose
+
+    def sample(self,samples=10):
+        """
+        Sample from the truncated MVN.
+        Parameters:
+            samples = number of samples (default 10).
+        """
+        xs = np.zeros([0,len(self.mean)])
+        for it in range(100):
+            samps = np.random.multivariate_normal(self.mean,self.cov,1000)
+            keep = np.min(self.Phi @ samps.T,0)>0
+            xs = np.r_[xs,samps[keep,:]]
+            if len(xs)>samples:
+                return xs[:samples,:]
+        raise NotFindingEnoughSamplesDueToRejection
+        
+class TruncMVNreparam(TruncMVN):
+    def __init__(self,mean,cov,planes,thinning=1,burnin=None,verbose=False):
+        """
+        Create the truncated MVN. You need to specify the mean and covariance of the multivariate normal (MVN), and
+        the normals to the planes that will truncate this MVN. We assume for this version that the planes pass through
+        the origin (as this was our use case).
+        
+        mean = (D) vector: location of the MVN
+        cov = (DxD) matrix: covariance of the MVN
+        planes = (NxD) matrix, each row a normal to a plane (vector points to 'valid' side of plane)
+        
+        thinning = how much thinning to do during sampling
+        burnin = how many iterations of burnin to have (defaults to number of iterations used to generate samples)
+        """
+        self.L = np.linalg.cholesky(cov)
+        self.invL = np.linalg.inv(self.L) #TODO Don't need to invert maybe if we have chole.?
+        self.transformed_planes = planes @ self.L
+        self.mean = mean.astype(float)
+        self.cov = cov.astype(float)
+        self.Phi = planes.astype(float)
+        self.thinning = thinning
+        self.burnin = burnin
+        self.verbose = verbose
+        self.transformed_cov = np.eye(len(cov))
+        self.transformed_mean = mean @ self.invL.T        
+        self.TMVN = TruncMVN(self.transformed_mean,self.transformed_cov,self.transformed_planes,thinning=thinning,burnin=burnin,verbose=verbose)
+        
+
+    def sample(self,initx=None,samples=10,usecaching=False):
+        """
+        Sample from the truncated MVN.
+        Parameters:
+            initx = the start location for sampling, if not set, then the tool tries to find a valid (non-zero/truncated) location
+                        close to the MVN's mean.
+            samples = number of samples (default 10).
+            usecaching = whether to precache samples (the truncnorm rvs method is faster if you ask for lots of samples at once!)
+        """
+        return self.TMVN.sample(initx=initx,samples=samples,usecaching=usecaching) @ self.L.T
+           
+        
+
                     
 #Including plotting function for the contour ellipse to let us easily plot the demo/example.
 def confidence_ellipse(mean, cov, ax=None, n_std=1.0, edgecolor='black',facecolor='none', **kwargs):
