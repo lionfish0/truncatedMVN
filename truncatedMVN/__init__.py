@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Ellipse
 import matplotlib.transforms as transforms
-
+from scipy.optimize import minimize
 class NoValidStartPointFoundError(ValueError):
     '''raise this when the method can't find a good start location'''
     
@@ -30,6 +30,7 @@ class TruncMVN():
         self.thinning = thinning
         self.burnin = burnin
         self.verbose = verbose
+        self.startpoint = None #needs to be computed.
         #self.fast_populate_truncnorm()
         
 
@@ -90,7 +91,22 @@ class TruncMVN():
         p = x - d * w
         return p
 
-    def findstartpoint(self,margin=1e-8):
+    def findstartpoint(self,margin=1e-4):
+        """Finds the start point by minimising the distance from the mean, while constrained by
+        the planes (plus the margin).
+        """
+        if self.verbose: print("Finding Start Point")
+        fun = lambda x: np.sum((x-self.mean)**2)
+        cons = ({'type': 'ineq', 'fun': lambda x:  self.Phi@x-margin})
+        res = minimize(fun, self.mean, method='SLSQP',
+                       constraints=cons)
+        if not np.all(self.Phi @ res.x > 0):
+            raise NoValidStartPointFoundError("No valid start location has been found. Specify one, using 'initx' and/or check the domain contains non-zero space (i.e. that the truncations don't completely occlude the space.")
+        return res.x
+        
+    def old_findstartpoint(self,margin=1e-8):
+        """Finds the start point by starting at the mean, and moving to the nearest point on each plane.
+        """
         startx = self.mean.copy()
         if self.verbose: print("Finding Start Point")
         for it in range(10000):
@@ -179,7 +195,9 @@ class TruncMVN():
             if not hasattr(self,'fast_samples'): self.fast_populate_truncnorm()
         
         if initx is None: 
-            initx = self.findstartpoint()
+            if self.startpoint is None:
+                self.startpoint = self.findstartpoint()
+            initx = self.startpoint.copy()
         else:
             try:
                 initx[0]
