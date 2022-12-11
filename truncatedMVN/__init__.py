@@ -11,7 +11,7 @@ class InvalidCovariance(ValueError):
     '''raise this when the covariance is singular'''    
 
 class TruncMVN():
-    def __init__(self,mean,cov,planes,thinning=1,burnin=None,verbose=False):
+    def __init__(self,mean,cov,planes,thinning=1,burnin=None,verbose=False,startpointnormalised=False):
         """
         Create the truncated MVN. You need to specify the mean and covariance of the multivariate normal (MVN), and
         the normals to the planes that will truncate this MVN. We assume for this version that the planes pass through
@@ -23,6 +23,7 @@ class TruncMVN():
         
         thinning = how much thinning to do during sampling
         burnin = how many iterations of burnin to have (defaults to number of iterations used to generate samples)
+        startpointnormalised = whether to normalise the start point (so that its vector has length=1, moves it to a hypersphere in same direction as originally discovered point. As all the planes pass through the origin, this should still be a valid location).
         """
         self.mean = mean.astype(float)
         self.cov = cov.astype(float)
@@ -31,6 +32,7 @@ class TruncMVN():
         self.burnin = burnin
         self.verbose = verbose
         self.startpoint = None #needs to be computed.
+        self.startpointnormalised = startpointnormalised
         #self.fast_populate_truncnorm()
         
 
@@ -91,7 +93,7 @@ class TruncMVN():
         p = x - d * w
         return p
 
-    def findstartpoint(self,margin=1e-4):
+    def findstartpoint_full(self,margin=1e-4):
         """Finds the start point by minimising the distance from the mean, while constrained by
         the planes (plus the margin).
         """
@@ -103,6 +105,44 @@ class TruncMVN():
         if not np.all(self.Phi @ res.x > 0):
             raise NoValidStartPointFoundError("No valid start location has been found. Specify one, using 'initx' and/or check the domain contains non-zero space (i.e. that the truncations don't completely occlude the space.")
         return res.x
+        
+    def findstartpoint(self,W=None,margin=1e-4):
+        """Finds the start point by minimising the distance from the mean, while constrained by
+        the planes (plus the margin).
+        
+        This method can use the W matrix (which has the frequencies). By just picking the longest wavelengths
+        and setting the rest to zero, we can optimise quicker.
+        
+        W = matrix of frequencies used to build the Phi matrix. Set to None to just use the full set.
+        """
+        #return self.findstartpoint_full(margin)
+        
+        if W is None:
+            if self.verbose: print("W not passed to findstartpoint, searching full space")
+            return self.findstartpoint_full(margin)
+        
+        #sort...
+        order = np.argsort(np.linalg.norm(W,axis=1))
+        for keepnum in [1280]: #Working on this - this starts us at a smoother location than we would want
+            if self.verbose: print("Searching using lowest %d dimensions..." % keepnum)
+            keep = order[:keepnum] #keep the lowest frequencies, as some combination of these will probably work
+        
+            fun = lambda x: np.sum((x-self.mean[keep])**2)
+            cons = ({'type': 'ineq', 'fun': lambda x:  self.Phi[:,keep]@x-margin})
+            res = minimize(fun, self.mean[keep], method='SLSQP',
+                           constraints=cons)
+        
+            fullx = np.zeros(len(self.mean))
+            fullx[keep] = res.x
+        
+            if np.all(self.Phi @ fullx > 0):
+                break
+                
+        if not np.all(self.Phi @ fullx > 0):
+            if self.verbose: print("Failed to find start point using constrained set of dimensions. Launching full space findstartpoint")
+            return self.findstartpoint_full(margin)
+            
+        return fullx
         
     def old_findstartpoint(self,margin=1e-8):
         """Finds the start point by starting at the mean, and moving to the nearest point on each plane.
@@ -182,7 +222,7 @@ class TruncMVN():
 
 
 
-    def sample(self,initx=None,samples=10,usecaching=False):
+    def sample(self,initx=None,samples=10,usecaching=False,W=None):
         """
         Sample from the truncated MVN.
         Parameters:
@@ -192,11 +232,16 @@ class TruncMVN():
             usecaching = whether to precache samples (the truncnorm rvs method is faster if you ask for lots of samples at once!)
         """
         if usecaching:
+            if self.verbose: print("Populating cache")
             if not hasattr(self,'fast_samples'): self.fast_populate_truncnorm()
         
-        if initx is None: 
+        if initx is None:
             if self.startpoint is None:
-                self.startpoint = self.findstartpoint()
+                if self.verbose: print("Finding start point")
+                self.startpoint = self.findstartpoint(W)
+                if self.startpointnormalised:
+                    print("Start point normalised")
+                    self.startpoint/=np.linalg.norm(self.startpoint)
             initx = self.startpoint.copy()
         else:
             try:
@@ -206,6 +251,9 @@ class TruncMVN():
             
         x = initx
         xs = []
+        
+        if not np.all(self.Phi @ x > 0):
+            raise NoValidStartPointFoundError("Invalid start location has been used.")
         
         if self.verbose: print("Computing inverse, for conditional distributions.")
         invcov = np.linalg.inv(self.cov)
@@ -220,19 +268,28 @@ class TruncMVN():
         self.previous = self.Phi @ x
         self.previousx = x[-1]
 
-        self.invprevious = invcov@(x-self.mean)
-        self.previousxminusmean = x[-1] - self.mean[-1]
+        #self.invprevious = invcov@(x-self.mean)
+        #self.previousxminusmean = x[-1] - self.mean[-1]
         
+        
+        
+        if self.verbose: print("Starting sampling loop")
         for it in range(samples*self.thinning+burnin):
             if self.verbose: print("%5d/%5d [%s]\r" % (it,samples*self.thinning+burnin,"burn-in" if it<burnin else "samples"), end="")
             for axis in range(len(self.mean)):
-                cond_var = 1/invcov[axis,axis] #self.cov[axis,axis] - remcovinvtimesrmmat[axis] @ remcovmat[axis].T
-                #invcovmod = self.invprevious - invcov[:,axis-1]*self.previousxminusmean + invcov[:,axis-1]*(x[axis-1]-self.mean[axis-1])
-                invcovmod = self.invprevious + invcov[:,axis-1]*((x[axis-1]-self.mean[axis-1])-self.previousxminusmean)
-    
-                self.invprevious = invcovmod
-                self.previousxminusmean = x[axis] - self.mean[axis]
-                cond_mean = x[axis] - invcovmod[axis]/invcov[axis,axis]
+                temp = x - self.mean
+                temp[axis]=0
+                cond_mean = self.mean[axis] - invcov[:,axis] @ temp / invcov[axis,axis]
+                cond_var = 1/invcov[axis,axis]
+                
+                
+                
+                #cond_var = 1/invcov[axis,axis] #self.cov[axis,axis] - remcovinvtimesrmmat[axis] @ remcovmat[axis].T
+                #invcovmod = self.invprevious + invcov[:,axis-1]*((x[axis-1]-self.mean[axis-1])-self.previousxminusmean)
+                #self.invprevious = invcovmod
+                #self.previousxminusmean = x[axis] - self.mean[axis]
+                #cond_mean = x[axis] - invcovmod[axis]/invcov[axis,axis]
+                #print("%7.2f=%7.2f, %7.2f=%7.2f" % (new_cond_mean,cond_mean,new_cond_var,cond_var))
 
                 bs = self.getboundaries(x,axis,axis-1)                
                 
@@ -331,7 +388,7 @@ class TruncMVNrejection(TruncMVN):
         raise NotFindingEnoughSamplesDueToRejection
         
 class TruncMVNreparam(TruncMVN):
-    def __init__(self,mean,cov,planes,thinning=1,burnin=None,verbose=False):
+    def __init__(self,mean,cov,planes,thinning=1,burnin=None,verbose=False,startpointnormalised=False):
         """
         Create the truncated MVN. You need to specify the mean and covariance of the multivariate normal (MVN), and
         the normals to the planes that will truncate this MVN. We assume for this version that the planes pass through
@@ -344,7 +401,9 @@ class TruncMVNreparam(TruncMVN):
         thinning = how much thinning to do during sampling
         burnin = how many iterations of burnin to have (defaults to number of iterations used to generate samples)
         """
+        if verbose: print("Computing Cholesky...")
         self.L = np.linalg.cholesky(cov)
+        if verbose: print("Inverting Cholesky...")        
         self.invL = np.linalg.inv(self.L) #TODO Don't need to invert maybe if we have chole.?
         self.transformed_planes = planes @ self.L
         self.mean = mean.astype(float)
@@ -355,10 +414,10 @@ class TruncMVNreparam(TruncMVN):
         self.verbose = verbose
         self.transformed_cov = np.eye(len(cov))
         self.transformed_mean = mean @ self.invL.T        
-        self.TMVN = TruncMVN(self.transformed_mean,self.transformed_cov,self.transformed_planes,thinning=thinning,burnin=burnin,verbose=verbose)
+        self.TMVN = TruncMVN(self.transformed_mean,self.transformed_cov,self.transformed_planes,thinning=thinning,burnin=burnin,verbose=verbose,startpointnormalised=startpointnormalised)
         
 
-    def sample(self,initx=None,samples=10,usecaching=False):
+    def sample(self,initx=None,samples=10,usecaching=False,W=None):
         """
         Sample from the truncated MVN.
         Parameters:
@@ -367,7 +426,13 @@ class TruncMVNreparam(TruncMVN):
             samples = number of samples (default 10).
             usecaching = whether to precache samples (the truncnorm rvs method is faster if you ask for lots of samples at once!)
         """
-        return self.TMVN.sample(initx=initx,samples=samples,usecaching=usecaching) @ self.L.T
+        
+        if initx is None:
+            #The transformed version is tricky to find the start point
+            initx = self.findstartpoint(W)
+            initx = initx @ self.invL.T
+        
+        return self.TMVN.sample(initx=initx,samples=samples,usecaching=usecaching,W=W) @ self.L.T
            
         
 
