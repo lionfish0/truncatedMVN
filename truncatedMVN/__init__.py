@@ -4,6 +4,14 @@ import numpy as np
 from matplotlib.patches import Ellipse
 import matplotlib.transforms as transforms
 from scipy.optimize import minimize
+try:
+    from qpsolvers import solve_qp
+    use_qpsolvers = True
+except ImportError:
+    print("Recommend you install qpsolvers, e.g. run: conda install qpsolvers -c conda-forge. Falling back to scipy.minimize.")
+    use_qpsolvers = False
+
+
 class NoValidStartPointFoundError(ValueError):
     '''raise this when the method can't find a good start location'''
     
@@ -93,73 +101,37 @@ class TruncMVN():
         p = x - d * w
         return p
 
-    def findstartpoint_full(self,margin=1e-4):
-        """Finds the start point by minimising the distance from the mean, while constrained by
-        the planes (plus the margin).
-        """
-        if self.verbose: print("Finding Start Point")
-        fun = lambda x: np.sum((x-self.mean)**2)
+    def findnearestvalidpoint_scipy(self,targetpoint,margin=1e-4):
+        print("Using slow scipy minimize method.")
+        fun = lambda x: np.sum((x-targetpoint)**2)
         cons = ({'type': 'ineq', 'fun': lambda x:  self.Phi@x-margin})
-        res = minimize(fun, self.mean, method='SLSQP',
+        res = minimize(fun, targetpoint, method='SLSQP',
                        constraints=cons)
         if not np.all(self.Phi @ res.x > 0):
             raise NoValidStartPointFoundError("No valid start location has been found. Specify one, using 'initx' and/or check the domain contains non-zero space (i.e. that the truncations don't completely occlude the space.")
-        return res.x
-        
-    def findstartpoint(self,W=None,margin=1e-4):
+        return res.x+targetpoint
+
+    def findnearestvalidpoint_qpsolvers(self,targetpoint,margin=1e-4):
+        """
+        Finds the nearest point to 'targetpoint' that achieves non-negatives in grid.
+        """
+        P = np.eye(len(targetpoint))
+        q = np.zeros_like(targetpoint)
+        G = -self.Phi
+        h = np.array(self.Phi@targetpoint-margin)
+        return solve_qp(P, q, G, h, solver='quadprog', verbose=False)+targetpoint
+
+
+    def findstartpoint(self,margin=1e-4):
         """Finds the start point by minimising the distance from the mean, while constrained by
         the planes (plus the margin).
-        
-        This method can use the W matrix (which has the frequencies). By just picking the longest wavelengths
-        and setting the rest to zero, we can optimise quicker.
-        
-        W = matrix of frequencies used to build the Phi matrix. Set to None to just use the full set.
         """
-        #return self.findstartpoint_full(margin)
-        
-        if W is None:
-            if self.verbose: print("W not passed to findstartpoint, searching full space")
-            return self.findstartpoint_full(margin)
-        
-        #sort...
-        order = np.argsort(np.linalg.norm(W,axis=1))
-        for keepnum in [1280]: #Working on this - this starts us at a smoother location than we would want
-            if self.verbose: print("Searching using lowest %d dimensions..." % keepnum)
-            keep = order[:keepnum] #keep the lowest frequencies, as some combination of these will probably work
-        
-            fun = lambda x: np.sum((x-self.mean[keep])**2)
-            cons = ({'type': 'ineq', 'fun': lambda x:  self.Phi[:,keep]@x-margin})
-            res = minimize(fun, self.mean[keep], method='SLSQP',
-                           constraints=cons)
-        
-            fullx = np.zeros(len(self.mean))
-            fullx[keep] = res.x
-        
-            if np.all(self.Phi @ fullx > 0):
-                break
-                
-        if not np.all(self.Phi @ fullx > 0):
-            if self.verbose: print("Failed to find start point using constrained set of dimensions. Launching full space findstartpoint")
-            return self.findstartpoint_full(margin)
-            
-        return fullx
-        
-    def old_findstartpoint(self,margin=1e-8):
-        """Finds the start point by starting at the mean, and moving to the nearest point on each plane.
-        """
-        startx = self.mean.copy()
-        if self.verbose: print("Finding Start Point")
-        for it in range(10000):
-            if self.verbose: print(".",end="")
-            v = self.Phi @ startx
-            idx = np.where(v<margin)[0] #get planes that we are on the wrong side of
-            if len(idx)==0: 
-                if self.verbose: print("")
-                return startx
-            startx = self.getnearestpoint(self.Phi.T[:,idx[0]],startx)
+        if use_qpsolvers:
+            return self.findnearestvalidpoint_qpsolvers(self.mean)
+        else:
+            return self.findnearestvalidpoint_scipy(self.mean)
 
-        raise NoValidStartPointFoundError("No valid start location has been found. Specify one, using 'initx' and/or check the domain contains non-zero space (i.e. that the truncations don't completely occlude the space.")
-        
+
     def sample_truncnorm(self,a,b,loc,scale,size):
         """
         Sample from a one dimensional (univariate) truncated normal, that has mean at 'loc', standard deviation 'scale',
@@ -222,7 +194,7 @@ class TruncMVN():
 
 
 
-    def sample(self,initx=None,samples=10,usecaching=False,W=None):
+    def sample(self,initx=None,samples=10,usecaching=False):
         """
         Sample from the truncated MVN.
         Parameters:
@@ -238,7 +210,7 @@ class TruncMVN():
         if initx is None:
             if self.startpoint is None:
                 if self.verbose: print("Finding start point")
-                self.startpoint = self.findstartpoint(W)
+                self.startpoint = self.findstartpoint()
                 if self.startpointnormalised:
                     print("Start point normalised")
                     self.startpoint/=np.linalg.norm(self.startpoint)
@@ -417,7 +389,7 @@ class TruncMVNreparam(TruncMVN):
         self.TMVN = TruncMVN(self.transformed_mean,self.transformed_cov,self.transformed_planes,thinning=thinning,burnin=burnin,verbose=verbose,startpointnormalised=startpointnormalised)
         
 
-    def sample(self,initx=None,samples=10,usecaching=False,W=None):
+    def sample(self,initx=None,samples=10,usecaching=False):
         """
         Sample from the truncated MVN.
         Parameters:
@@ -429,10 +401,10 @@ class TruncMVNreparam(TruncMVN):
         
         if initx is None:
             #The transformed version is tricky to find the start point
-            initx = self.findstartpoint(W)
+            initx = self.findstartpoint()
             initx = initx @ self.invL.T
         
-        return self.TMVN.sample(initx=initx,samples=samples,usecaching=usecaching,W=W) @ self.L.T
+        return self.TMVN.sample(initx=initx,samples=samples,usecaching=usecaching) @ self.L.T
            
         
 
