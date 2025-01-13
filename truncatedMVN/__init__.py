@@ -4,6 +4,7 @@ import numpy as np
 from matplotlib.patches import Ellipse
 import matplotlib.transforms as transforms
 from scipy.optimize import minimize
+
 try:
     from qpsolvers import solve_qp
     use_qpsolvers = True
@@ -45,7 +46,7 @@ class TruncMVN():
         
 
     def getboundaries(self,x,axis,update_axis):
-        """
+        r"""
         For a location 'x', and a given axis direction (specified by 'axis'),
              find the points of these planes nearest to x along the axis passing through x.
 
@@ -67,7 +68,7 @@ class TruncMVN():
                  \   \                 /          |
         Returns: (a list) of the two scalar values of these two points (a) and (b) along the axis.
         """
-
+        
         #avoids division by zero warnings
         P = self.Phi.T[axis]
         P[P==0]=1e-9
@@ -129,6 +130,7 @@ class TruncMVN():
         if use_qpsolvers:
             return self.findnearestvalidpoint_qpsolvers(self.mean)
         else:
+            print("Recommend you install qpsolvers, e.g. run: conda install qpsolvers -c conda-forge. Falling back to scipy.minimize.")
             return self.findnearestvalidpoint_scipy(self.mean)
 
 
@@ -247,7 +249,7 @@ class TruncMVN():
         
         if self.verbose: print("Starting sampling loop")
         for it in range(samples*self.thinning+burnin):
-            if self.verbose: print("%5d/%5d [%s]\r" % (it,samples*self.thinning+burnin,"burn-in" if it<burnin else "samples"), end="")
+            if self.verbose: print("%5d/%5d [%s]\r" % (it,samples*self.thinning+burnin,"burn-in" if it<burnin else "samples"))#, end="")
             for axis in range(len(self.mean)):
                 temp = x - self.mean
                 temp[axis]=0
